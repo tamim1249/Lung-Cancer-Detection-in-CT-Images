@@ -1,0 +1,165 @@
+data = []
+img_size = 256
+
+for i in categories:
+    path = os.path.join(directory, i)
+    class_num = categories.index(i)
+    for file in os.listdir(path):
+        filepath = os.path.join(path, file)
+        img = cv2.imread(filepath, 0)
+        # preprocess here
+        img = cv2.resize(img, (img_size, img_size))
+        data.append([img, class_num])
+        
+random.shuffle(data)
+
+X, y = [], []
+for feature, label in data:
+    X.append(feature)
+    y.append(label)
+    
+print('X length:', len(X))
+print('y counts:', Counter(y))
+
+# normalize
+X = np.array(X).reshape(-1, img_size, img_size, 1)
+X = X / 255.0
+y = np.array(y)
+
+X_train, X_valid, y_train, y_valid = train_test_split(X, y, random_state=10, stratify=y)
+
+print(len(X_train), X_train.shape)
+print(len(X_valid), X_valid.shape)
+SEED = 42
+
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+
+set_seed(SEED)
+print("TensorFlow version:", tf.__version__)
+
+print("X_train:", X_train.shape, X_train.dtype)
+print("X_valid:", X_valid.shape, X_valid.dtype)
+
+print("y_train shape:", np.shape(y_train))
+print("y_valid shape:", np.shape(y_valid))
+
+def prepare_labels(y_train, y_valid):
+    y_train = np.array(y_train)
+    y_valid = np.array(y_valid)
+
+    # case 1: already one-hot
+    if y_train.ndim == 2 and y_train.shape[1] > 1:
+        num_classes = y_train.shape[1]
+        y_train_cat = y_train.astype(np.float32)
+        y_valid_cat = y_valid.astype(np.float32)
+
+        y_train_int = np.argmax(y_train_cat, axis=1)
+        y_valid_int = np.argmax(y_valid_cat, axis=1)
+
+    # case 2: integer labels
+    else:
+        y_train_int = y_train.astype(np.int32).reshape(-1)
+        y_valid_int = y_valid.astype(np.int32).reshape(-1)
+
+        num_classes = len(np.unique(y_train_int))
+        y_train_cat = to_categorical(y_train_int, num_classes=num_classes)
+        y_valid_cat = to_categorical(y_valid_int, num_classes=num_classes)
+
+    return y_train_int, y_valid_int, y_train_cat, y_valid_cat, num_classes
+
+y_train_int, y_valid_int, y_train_cat, y_valid_cat, NUM_CLASSES = prepare_labels(y_train, y_valid)
+
+print("NUM_CLASSES:", NUM_CLASSES)
+print("y_train_cat:", y_train_cat.shape)
+print("y_valid_cat:", y_valid_cat.shape)
+#Normalize Images
+def normalize_images(x):
+    x = x.astype(np.float32)
+
+    if x.max() > 1.0:
+        x = x / 255.0
+
+    return x
+
+X_train = normalize_images(X_train)
+X_valid = normalize_images(X_valid)
+
+print(X_train.min(), X_train.max(), X_train.shape)
+print(X_valid.min(), X_valid.max(), X_valid.shape)
+# Visualization
+def show_samples(images, labels, n=6):
+    plt.figure(figsize=(15, 4))
+    idxs = np.random.choice(len(images), n, replace=False)
+
+    for i, idx in enumerate(idxs):
+        # print(labels[idx])
+        plt.subplot(1, n, i + 1)
+        plt.imshow(images[idx].squeeze(), cmap='gray')
+        plt.title(f"Class: {categories[labels[idx]]}")
+        
+        plt.axis("off")
+    plt.tight_layout()
+    plt.show()
+    print(labels[idx])
+
+show_samples(X_train, y_train_int, n=6)
+def adaptive_gaussian_filter(img, ksize=5):
+    """
+    img: (H, W) float32 in [0,1]
+    returns denoised image in [0,1]
+    """
+    img_8 = (img * 255).astype(np.uint8)
+
+    blurred = cv2.GaussianBlur(img_8, (ksize, ksize), 0)
+
+    # local variance proxy
+    lap = cv2.Laplacian(img_8, cv2.CV_32F)
+    var_map = cv2.GaussianBlur(np.abs(lap), (ksize, ksize), 0)
+
+    var_map = var_map / (var_map.max() + 1e-8)
+
+    # higher texture => preserve original more
+    # smoother/noisy flat regions => use more blur
+    alpha = np.expand_dims(var_map, axis=-1) if var_map.ndim == 2 else var_map
+
+    img_f = img_8.astype(np.float32) / 255.0
+    blurred_f = blurred.astype(np.float32) / 255.0
+
+    out = alpha[..., 0] * img_f + (1.0 - alpha[..., 0]) * blurred_f
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+def apply_denoising_batch(x):
+    out = []
+    for img in tqdm(x, desc="Denoising"):
+        den = adaptive_gaussian_filter(img.squeeze())
+        out.append(den[..., np.newaxis])
+    return np.array(out, dtype=np.float32)
+
+X_train_denoised = apply_denoising_batch(X_train)
+X_valid_denoised = apply_denoising_batch(X_valid)
+
+print(X_train_denoised.shape, X_valid_denoised.shape)
+
+def compare_original_denoised(x_orig, x_den, n=4):
+    idxs = np.random.choice(len(x_orig), n, replace=False)
+    plt.figure(figsize=(12, 6))
+
+    for i, idx in enumerate(idxs):
+        plt.subplot(2, n, i + 1)
+        plt.imshow(x_orig[idx].squeeze(), cmap='gray')
+        plt.title("Original")
+        plt.axis("off")
+
+        plt.subplot(2, n, n + i + 1)
+        plt.imshow(x_den[idx].squeeze(), cmap='gray')
+        plt.title("Denoised")
+        plt.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+compare_original_denoised(X_train, X_train_denoised, n=4)
+
