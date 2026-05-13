@@ -1,0 +1,166 @@
+def build__model(input_shape=(256, 256, 1), feature_dim=None, num_classes=3, train_base=False):
+    # image input
+    img_input = layers.Input(shape=input_shape, name="image_input")
+
+    # handcrafted feature input
+    feat_input = layers.Input(shape=(feature_dim,), name="handcrafted_input")
+
+    # grayscale -> rgb
+    x = layers.Concatenate(name="gray_to_rgb")([img_input, img_input, img_input])
+
+    # resize for InceptionV3
+    x = layers.Resizing(224, 224, name="resize_224")(x)
+
+    # base model
+    base_model = tf.keras.applications.InceptionV3(
+        include_top=False,
+        weights="imagenet",
+        input_tensor=x
+    )
+    base_model.trainable = train_base
+
+    # choose a feature map from InceptionV3
+    feat_map = base_model.get_layer("mixed7").output
+
+    # MSCA block
+    x = msca_block(feat_map, ratio=8, name="msca")
+
+    # deeper conv refinement
+    x = layers.Conv2D(256, 3, padding='same', activation='relu', name="refine_conv1")(x)
+    x = layers.BatchNormalization(name="refine_bn1")(x)
+    x = layers.Conv2D(256, 3, padding='same', activation='relu', name="refine_conv2")(x)
+    x = layers.BatchNormalization(name="refine_bn2")(x)
+
+    # this layer will be useful for Grad-CAM
+    x = layers.Conv2D(128, 3, padding='same', activation='relu', name="gradcam_target")(x)
+
+    deep_feat = layers.GlobalAveragePooling2D(name="deep_gap")(x)
+    deep_feat = layers.Dropout(0.3, name="deep_dropout")(deep_feat)
+
+    # handcrafted branch
+    h = layers.Dense(128, activation='relu', name="hand_fc1")(feat_input)
+    h = layers.BatchNormalization(name="hand_bn1")(h)
+    h = layers.Dropout(0.3, name="hand_dropout1")(h)
+
+    h = layers.Dense(64, activation='relu', name="hand_fc2")(h)
+    h = layers.BatchNormalization(name="hand_bn2")(h)
+
+    # fusion
+    fused = layers.Concatenate(name="feature_fusion")([deep_feat, h])
+
+    # MLP classifier
+    z = layers.Dense(256, activation='relu', name="mlp_fc1")(fused)
+    z = layers.BatchNormalization(name="mlp_bn1")(z)
+    z = layers.Dropout(0.4, name="mlp_dropout1")(z)
+
+    z = layers.Dense(128, activation='relu', name="mlp_fc2")(z)
+    z = layers.BatchNormalization(name="mlp_bn2")(z)
+    z = layers.Dropout(0.3, name="mlp_dropout2")(z)
+
+    output = layers.Dense(num_classes, activation='softmax', name="prediction")(z)
+
+    model = Model(inputs=[img_input, feat_input], outputs=output, name="PaperLike_MSCA_Inception_GLCM_LBP_MLP")
+    return model
+
+model = build__model(
+    input_shape=(256, 256, 1),
+    feature_dim=X_train_feats_std.shape[1],
+    num_classes=NUM_CLASSES,
+    train_base=False
+)
+
+model.summary()
+model.compile(
+    optimizer=Adam(learning_rate=1e-4),
+    loss="categorical_crossentropy",
+    metrics=[
+        "accuracy",
+        tf.keras.metrics.AUC(name="auc"),
+        tf.keras.metrics.Precision(name="precision"),
+        tf.keras.metrics.Recall(name="recall")
+    ]
+)
+
+callbacks = [
+    EarlyStopping(
+        monitor="val_loss",
+        patience=8,
+        restore_best_weights=True,
+        verbose=1
+    ),
+    ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.5,
+        patience=3,
+        min_lr=1e-7,
+        verbose=1
+    ),
+    ModelCheckpoint(
+        "best__model.keras",
+        monitor="val_loss",
+        save_best_only=True,
+        verbose=1
+    )
+]
+history = model.fit(
+    x=[X_train_denoised, X_train_feats_std],
+    y=y_train_cat,
+    validation_data=([X_valid_denoised, X_valid_feats_std], y_valid_cat),
+    epochs=30,
+    batch_size=16,
+    class_weight=class_weight_dict,
+    callbacks=callbacks,
+    verbose=1
+)
+
+def plot_history(history):
+    hist = history.history
+    keys = [k for k in hist.keys() if not k.startswith("val_")]
+
+    plt.figure(figsize=(14, 5))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(hist["loss"], label="train_loss")
+    plt.plot(hist["val_loss"], label="val_loss")
+    plt.legend()
+    plt.title("Loss")
+
+    plt.subplot(1, 2, 2)
+    plt.plot(hist["accuracy"], label="train_acc")
+    plt.plot(hist["val_accuracy"], label="val_acc")
+    plt.legend()
+    plt.title("Accuracy")
+
+    plt.tight_layout()
+    plt.show()
+
+plot_history(history)
+results = model.evaluate(
+    [X_valid_denoised, X_valid_feats_std],
+    y_valid_cat,
+    verbose=1
+)
+
+for name, value in zip(model.metrics_names, results):
+    print(f"{name}: {value:.4f}")
+y_pred_prob = model.predict([X_valid_denoised, X_valid_feats_std], verbose=1)
+y_pred = np.argmax(y_pred_prob, axis=1)
+
+print(classification_report(y_valid_int, y_pred, digits=4))
+print("Confusion Matrix:\n", confusion_matrix(y_valid_int, y_pred))
+
+
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+cm = confusion_matrix(y_valid_int, y_pred)
+
+disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+disp.plot(cmap='Blues')
+
+plt.title("Confusion Matrix")
+plt.show()
+
+try:
+    auc_score = roc_auc_score(y_valid_cat, y_pred_prob, multi_class='ovr')
+    print("Validation ROC-AUC:", round(auc_score, 4))
+except Exception as e:
+    print("ROC-AUC could not be computed:", e)
