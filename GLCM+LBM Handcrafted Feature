@@ -1,0 +1,62 @@
+def extract_glcm_lbp_features_single(img, distances=[1, 2], angles=None, lbp_points=8, lbp_radius=1):
+    """
+    img: (H, W) float32 [0,1]
+    """
+    if angles is None:
+        angles = [0, np.pi/4, np.pi/2, 3*np.pi/4]
+
+    img_8 = (img * 255).astype(np.uint8)
+
+    # GLCM
+    glcm = graycomatrix(
+        img_8,
+        distances=distances,
+        angles=angles,
+        levels=256,
+        symmetric=True,
+        normed=True
+    )
+
+    glcm_feats = []
+    for prop in ['contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation', 'ASM']:
+        vals = graycoprops(glcm, prop).flatten()
+        glcm_feats.extend(vals.tolist())
+
+    # LBP
+    lbp = local_binary_pattern(img_8, P=lbp_points, R=lbp_radius, method='uniform')
+    n_bins = lbp_points + 2
+    lbp_hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, n_bins + 1), range=(0, n_bins))
+    lbp_hist = lbp_hist.astype(np.float32)
+    lbp_hist /= (lbp_hist.sum() + 1e-8)
+
+    feats = np.concatenate([np.array(glcm_feats, dtype=np.float32), lbp_hist], axis=0)
+    return feats.astype(np.float32)
+
+def extract_features_batch(x):
+    feats = []
+    for img in tqdm(x, desc="Extracting GLCM+LBP"):
+        f = extract_glcm_lbp_features_single(img.squeeze())
+        feats.append(f)
+    return np.array(feats, dtype=np.float32)
+
+X_train_feats = extract_features_batch(X_train_denoised)
+X_valid_feats = extract_features_batch(X_valid_denoised)
+
+print("Handcrafted feature shape:", X_train_feats.shape, X_valid_feats.shape)
+
+train_mean = X_train_feats.mean(axis=0, keepdims=True)
+train_std = X_train_feats.std(axis=0, keepdims=True) + 1e-8
+
+X_train_feats_std = (X_train_feats - train_mean) / train_std
+X_valid_feats_std = (X_valid_feats - train_mean) / train_std
+
+print(X_train_feats_std.shape, X_valid_feats_std.shape)
+
+class_weights = compute_class_weight(
+    class_weight="balanced",
+    classes=np.unique(y_train_int),
+    y=y_train_int
+)
+
+class_weight_dict = {i: w for i, w in enumerate(class_weights)}
+print(class_weight_dict)
