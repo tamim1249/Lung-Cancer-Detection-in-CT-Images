@@ -1,0 +1,92 @@
+def make_gradcam_heatmap(model, image_array, feature_array, last_conv_layer_name="gradcam_target", class_index=None):
+    """
+    image_array: shape (1, 256, 256, 1)
+    feature_array: shape (1, feat_dim)
+    """
+    grad_model = tf.keras.models.Model(
+        inputs=model.inputs,
+        outputs=[
+            model.get_layer(last_conv_layer_name).output,
+            model.output
+        ]
+    )
+
+    with tf.GradientTape() as tape:
+        conv_outputs, preds = grad_model([image_array, feature_array], training=False)
+
+        if class_index is None:
+            class_index = tf.argmax(preds[0])
+
+        class_channel = preds[:, class_index]
+
+    grads = tape.gradient(class_channel, conv_outputs)
+
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_outputs = conv_outputs[0]
+
+    heatmap = tf.reduce_sum(tf.multiply(pooled_grads, conv_outputs), axis=-1)
+
+    heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-8)
+    heatmap = heatmap.numpy()
+
+    return heatmap, int(class_index.numpy() if hasattr(class_index, "numpy") else class_index), preds.numpy()[0]
+
+def overlay_gradcam(image, heatmap, alpha=0.4):
+    """
+    image: (256,256) float in [0,1]
+    heatmap: smaller map from conv layer
+    """
+    heatmap_resized = cv2.resize(heatmap, (image.shape[1], image.shape[0]))
+    heatmap_uint8 = np.uint8(255 * heatmap_resized)
+    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+    heatmap_color = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+
+    image_rgb = np.stack([image, image, image], axis=-1)
+    image_rgb = np.uint8(255 * image_rgb)
+
+    overlay = cv2.addWeighted(image_rgb, 1 - alpha, heatmap_color, alpha, 0)
+    return heatmap_resized, overlay
+
+# class_names = [f"Class_{i}" for i in range(NUM_CLASSES)]
+class_names = categories
+
+def show_gradcam_for_index(model, x_images, x_feats, y_true_int, index):
+    image = x_images[index:index+1]
+    feat = x_feats[index:index+1]
+
+    heatmap, pred_class, pred_probs = make_gradcam_heatmap(
+        model=model,
+        image_array=image,
+        feature_array=feat,
+        last_conv_layer_name="gradcam_target",
+        class_index=None
+    )
+
+    heatmap_resized, overlay = overlay_gradcam(image[0].squeeze(), heatmap, alpha=0.4)
+
+    plt.figure(figsize=(14, 4))
+
+    plt.subplot(1, 3, 1)
+    plt.imshow(image[0].squeeze(), cmap='gray')
+    plt.title(f"Original\nTrue: {class_names[y_true_int[index]]}")
+    plt.axis("off")
+
+    plt.subplot(1, 3, 2)
+    plt.imshow(heatmap_resized, cmap='jet')
+    plt.title("Grad-CAM Heatmap")
+    plt.axis("off")
+
+    plt.subplot(1, 3, 3)
+    plt.imshow(overlay)
+    plt.title(f"Overlay\nPred: {class_names[pred_class]}")
+    plt.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+    print("Predicted probabilities:")
+    for i, p in enumerate(pred_probs):
+        print(f"{class_names[i]}: {p:.4f}")
+
+sample_idx = 0
+show_gradcam_for_index(model, X_valid_denoised, X_valid_feats_std, y_valid_int, sample_idx)
